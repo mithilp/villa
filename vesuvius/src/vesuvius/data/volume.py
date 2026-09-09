@@ -58,6 +58,24 @@ def _is_transient_read_error(exc: BaseException) -> bool:
     return False
 
 
+def _as_number(value: Any) -> Optional[float]:
+    """Parse a config key as a number, or None if it is not one.
+
+    Config keys are strings ("54", "7.91"), but a hand-edited file can hold
+    anything, so callers get None rather than an exception.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _numeric_sort_key(value: Any) -> Tuple[float, str]:
+    """Sort config keys numerically, with unparseable keys last and stable."""
+    number = _as_number(value)
+    return (float('inf') if number is None else number, str(value))
+
+
 # Define the functions needed here to avoid circular imports
 def list_files():
     """Load and return the scrolls configuration data from a YAML file."""
@@ -1108,27 +1126,86 @@ class Volume:
 
         return data_slice
 
-    def grab_canonical_energy(self) -> Optional[int]:
-        """Gets the default energy for a given scroll ID."""
-        # Ensure scroll_id is comparable
-        scroll_id_key = str(self.scroll_id) if self.scroll_id is not None else None
+    # Fallback defaults, used only when scrolls.yaml cannot be read or does not
+    # list the scroll. The config is the source of truth: these values are a
+    # last resort, and they drift as scans are added or restandardized.
+    _FALLBACK_ENERGY = {
+        "1": 54, "1b": 54, "2": 54, "2b": 54, "2c": 88,
+        "3": 53, "4": 88, "5": 53
+    }
+    _FALLBACK_RESOLUTION = {
+        "1": 7.91, "1b": 7.91, "2": 7.91, "2b": 7.91, "2c": 7.91,
+        "3": 3.24, "4": 3.24, "5": 7.91
+    }
 
-        energy_mapping = {
-            "1": 54, "1b": 54, "2": 54, "2b": 54, "2c": 88,
-            "3": 53, "4": 88, "5": 53
-        }
-        return energy_mapping.get(scroll_id_key)
+    def _config_entry_for_scroll(self) -> Optional[Dict[str, Any]]:
+        """The scrolls.yaml sub-tree for this scroll, or None.
+
+        Returns the ``{energy: {resolution: {...}}}`` mapping keyed under this
+        volume's scroll id. Any failure to read or parse the config returns
+        None so the caller can fall back rather than raise: resolving a default
+        must never be the thing that breaks a call the user made explicitly.
+        """
+        if self.scroll_id is None or not self.configs:
+            return None
+        try:
+            with open(self.configs, 'r') as handle:
+                data = yaml.safe_load(handle) or {}
+        except (OSError, yaml.YAMLError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        entry = data.get(str(self.scroll_id))
+        return entry if isinstance(entry, dict) else None
+
+    def grab_canonical_energy(self) -> Optional[int]:
+        """Gets the default energy for a given scroll ID.
+
+        Read from scrolls.yaml, preferring the historical default when the
+        config still offers it so existing calls resolve to the same scan.
+        """
+        scroll_id_key = str(self.scroll_id) if self.scroll_id is not None else None
+        fallback = self._FALLBACK_ENERGY.get(scroll_id_key)
+
+        entry = self._config_entry_for_scroll()
+        if not entry:
+            return fallback
+
+        if fallback is not None and str(fallback) in entry:
+            return fallback
+        for key in sorted(entry.keys(), key=_numeric_sort_key):
+            number = _as_number(key)
+            if number is not None:
+                return int(number)
+        return fallback
 
     def grab_canonical_resolution(self) -> Optional[float]:
-        """Gets the default resolution for a given scroll ID."""
-        # Ensure scroll_id is comparable
-        scroll_id_key = str(self.scroll_id) if self.scroll_id is not None else None
+        """Gets the default resolution for a given scroll ID.
 
-        resolution_mapping = {
-            "1": 7.91, "1b": 7.91, "2": 7.91, "2b": 7.91, "2c": 7.91,
-            "3": 3.24, "4": 3.24, "5": 7.91
-        }
-        return resolution_mapping.get(scroll_id_key)
+        Resolutions are nested under energy, so this resolves the energy first
+        and then picks a resolution offered for it. Falls back to the built-in
+        table only when the config cannot answer.
+        """
+        scroll_id_key = str(self.scroll_id) if self.scroll_id is not None else None
+        fallback = self._FALLBACK_RESOLUTION.get(scroll_id_key)
+
+        entry = self._config_entry_for_scroll()
+        if not entry:
+            return fallback
+
+        energy = self.energy if getattr(self, "energy", None) is not None \
+            else self.grab_canonical_energy()
+        resolutions = entry.get(str(energy))
+        if not isinstance(resolutions, dict) or not resolutions:
+            return fallback
+
+        if fallback is not None and str(fallback) in resolutions:
+            return fallback
+        for key in sorted(resolutions.keys(), key=_numeric_sort_key):
+            number = _as_number(key)
+            if number is not None:
+                return float(number)
+        return fallback
 
 
     def shape(self, subvolume_idx: int = 0) -> Tuple[int, ...]:
